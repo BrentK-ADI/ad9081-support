@@ -1,0 +1,173 @@
+From 3eb1a930afc65315910efde82320747c76aa1f4e Mon Sep 17 00:00:00 2001
+From: Brent Kowal <brent.kowal@analog.com>
+Date: Wed, 29 Jan 2025 17:04:54 -0500
+Subject: [PATCH] AD9081: Add Explicit PLL LUT
+
+Add a lookup table to define explicit combinations
+of DAC Clk and REF Clk where the algorithm can't
+determine R, M and N values.  The table currently
+only holds a few edge cases, but is generic enough
+to expand more as the applications need it.
+---
+ drivers/iio/adc/ad9081/adi_ad9081_device.c | 123 +++++++++++++++------
+ 1 file changed, 87 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/iio/adc/ad9081/adi_ad9081_device.c b/drivers/iio/adc/ad9081/adi_ad9081_device.c
+index 33623d6088cf..b7108203ebbc 100644
+--- a/drivers/iio/adc/ad9081/adi_ad9081_device.c
++++ b/drivers/iio/adc/ad9081/adi_ad9081_device.c
+@@ -407,6 +407,30 @@ int32_t adi_ad9081_device_clk_pll_div_set(adi_ad9081_device_t *device,
+ 	return API_CMS_ERROR_OK;
+ }
+ 
++/* Helper struct for holding the configuration values when
++   explicit PLL parameters need to be given
++  */
++typedef struct {
++	uint64_t dac_clk_hz;
++	uint64_t ref_clk_hz;
++	uint8_t ref_div;
++	uint8_t pll_div;
++	uint8_t n_div;
++	uint8_t m_div;
++} ad9081_explicit_pll_config_t;
++
++/* Lookup table of the explicit PLL parameters which have been
++   already defined. Note: This is not inclusive of all possibilities,
++   but updated based on application needs
++ */
++static const ad9081_explicit_pll_config_t explicit_pll_configs[] = {
++	{.dac_clk_hz = 12000000000ULL, .ref_clk_hz = 333333333ULL,
++	 .m_div = 9, .n_div = 8, .ref_div = 2, .pll_div = 1},
++	{.dac_clk_hz = 8000000000ULL, .ref_clk_hz = 333333333ULL,
++	 .m_div = 9, .n_div = 8, .ref_div = 3, .pll_div = 1}};
++static const size_t num_explicit_configs = 
++	sizeof(explicit_pll_configs)/sizeof(explicit_pll_configs[0]);
++
+ int32_t adi_ad9081_device_clk_pll_startup(adi_ad9081_device_t *device,
+ 					  uint64_t dac_clk_hz,
+ 					  uint64_t adc_clk_hz,
+@@ -415,50 +439,73 @@ int32_t adi_ad9081_device_clk_pll_startup(adi_ad9081_device_t *device,
+ 	int32_t err;
+ 	uint64_t vco_clk_hz, pfd_clk_hz;
+ 	uint8_t i, total_feedback;
++	uint8_t auto_calc = 1;
+ 	uint8_t ref_div = 1, n_div = 1, m_div = 1, pll_div = 1, fb_div = 1;
+ 	uint8_t n_div_vals[] = { 5, 7, 8, 11 };
+ 	AD9081_NULL_POINTER_RETURN(device);
+ 	AD9081_LOG_FUNC();
+ 
+-	/* find divider */
+-	for (ref_div = 1; ref_div <= 4; ref_div++) {
+-#ifdef __KERNEL__
+-		pfd_clk_hz = div_u64(ref_clk_hz, ref_div);
+-#else
+-		pfd_clk_hz = ref_clk_hz / ref_div;
+-#endif
+-		if (pfd_clk_hz > 750000000ULL)
+-			continue; /* 25~750MHz */
+-
+-		for (pll_div = 1; pll_div <= 4; pll_div++) {
+-			vco_clk_hz = dac_clk_hz * pll_div;
+-			if ((vco_clk_hz < 5800000000ULL) ||
+-			    (vco_clk_hz > 12000000000ULL))
+-				continue; /* 5.8~12GHz */
+-			for (i = 0; i <= 3; i++) {
+-				n_div = n_div_vals[i];
+-#ifdef __KERNEL__
+-				total_feedback =
+-					div_u64(vco_clk_hz, pfd_clk_hz);
+-#else
+-				total_feedback = vco_clk_hz / pfd_clk_hz;
+-#endif
+-				m_div = total_feedback / n_div;
+-				if ((m_div < 2) || (m_div > 50))
+-					continue;
+-				if ((pfd_clk_hz * n_div * m_div) != vco_clk_hz)
+-					continue;
+-				break;
++	/*	There are special cases, where the refclk is not an integer which 
++		doesn't allow for the math to generate the correct divisors.
++		For example a 333MHz refclk is really 333,333,333.33333~Hz. Without
++		including the decimal component, N, M and R can't be found.
++		For these cases, set the divisors manually, and bypass the auto_calc 
++		by finding defined edge cases in the lookup table
++	*/
++	for (i == 0; i < num_explicit_configs; i++ ) {
++		if ((dac_clk_hz == explicit_pll_configs[i].dac_clk_hz) &&
++			(ref_clk_hz == explicit_pll_configs[i].ref_clk_hz)) {
++			AD9081_LOG_WARN("Detected Explicit Configuration. Using fixed PLL values.");
++			auto_calc = 0; //Don't auto-calculate the PLL values
++			m_div = explicit_pll_configs[i].m_div;
++			n_div = explicit_pll_configs[i].n_div;
++			ref_div = explicit_pll_configs[i].ref_div;
++			pll_div = explicit_pll_configs[i].pll_div;
++			break;
++		}
++	}
++
++	if (auto_calc) {
++		/* find divider */
++		for (ref_div = 1; ref_div <= 4; ref_div++) {
++	#ifdef __KERNEL__
++			pfd_clk_hz = div_u64(ref_clk_hz, ref_div);
++	#else
++			pfd_clk_hz = ref_clk_hz / ref_div;
++	#endif
++			if (pfd_clk_hz > 750000000ULL)
++				continue; /* 25~750MHz */
++
++			for (pll_div = 1; pll_div <= 4; pll_div++) {
++				vco_clk_hz = dac_clk_hz * pll_div;
++				if ((vco_clk_hz < 5800000000ULL) ||
++					(vco_clk_hz > 12000000000ULL))
++					continue; /* 5.8~12GHz */
++				for (i = 0; i <= 3; i++) {
++					n_div = n_div_vals[i];
++	#ifdef __KERNEL__
++					total_feedback =
++						div_u64(vco_clk_hz, pfd_clk_hz);
++	#else
++					total_feedback = vco_clk_hz / pfd_clk_hz;
++	#endif
++					m_div = total_feedback / n_div;
++					if ((m_div < 2) || (m_div > 50))
++						continue;
++					if ((pfd_clk_hz * n_div * m_div) != vco_clk_hz)
++						continue;
++					break;
++				}
++				if (i <= 3)
++					break;
+ 			}
+-			if (i <= 3)
++			if (pll_div <= 4)
+ 				break;
+ 		}
+-		if (pll_div <= 4)
+-			break;
+-	}
+-	if (ref_div == 5) {
+-		AD9081_LOG_ERR("Cannot find any settings to lock device PLL.");
+-		return API_CMS_ERROR_INVALID_PARAM;
++		if (ref_div == 5) {
++			AD9081_LOG_ERR("Cannot find any settings to lock device PLL.");
++			return API_CMS_ERROR_INVALID_PARAM;
++		}
+ 	}
+ 
+ 	/* calculate fb div */
+@@ -470,6 +517,10 @@ int32_t adi_ad9081_device_clk_pll_startup(adi_ad9081_device_t *device,
+ 		fb_div = 2;
+ 	else if (n_div == 11)
+ 		fb_div = 3;
++	else {
++		AD9081_LOG_VAR(ADI_CMS_LOG_ERR, "Invalid n_div set (%d).", n_div);
++		return API_CMS_ERROR_INVALID_PARAM;
++	}
+ 
+ 	/* enable pll */
+ 	err = adi_ad9081_device_clk_pll_enable_set(device, 1);
+-- 
+2.34.1
+
