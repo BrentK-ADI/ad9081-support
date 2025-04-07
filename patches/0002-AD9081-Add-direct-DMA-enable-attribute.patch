@@ -1,0 +1,185 @@
+From 805c52e6e8743fe0d736af09d3ead919dc167ebd Mon Sep 17 00:00:00 2001
+From: Brent Kowal <brent.kowal@analog.com>
+Date: Mon, 7 Apr 2025 15:09:57 -0400
+Subject: [PATCH 2/2] AD9081: Add direct DMA enable attribute
+
+Use the processed ('input') attribute for the
+CF_AXI_DDS block to allow the user to explicitly
+enable the DMA data path in the IP core without
+needing to open a IIO Buffer to do so. Useful
+for switching in FPGA based datasources which
+do not leverage the PS/PL DMA capabilities.
+---
+ drivers/iio/frequency/cf_axi_dds.c            | 60 ++++++++++++++++++-
+ drivers/iio/frequency/cf_axi_dds.h            |  1 +
+ .../iio/frequency/cf_axi_dds_buffer_stream.c  |  6 +-
+ 3 files changed, 65 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/iio/frequency/cf_axi_dds.c b/drivers/iio/frequency/cf_axi_dds.c
+index 95f72b05413e..b9002824ea76 100644
+--- a/drivers/iio/frequency/cf_axi_dds.c
++++ b/drivers/iio/frequency/cf_axi_dds.c
+@@ -114,6 +114,7 @@ struct cf_axi_dds_state {
+ 	bool				standalone;
+ 	bool				dp_disable;
+ 	bool				enable;
++	bool				processed_en;
+ 	bool				pl_dma_fifo_en;
+ 	enum fifo_ctrl			dma_fifo_ctrl_bypass;
+ 	bool				dma_fifo_ctrl_oneshot;
+@@ -329,6 +330,12 @@ static int cf_axi_get_parent_sampling_frequency(struct cf_axi_dds_state *st,
+ 	return 0;
+ }
+ 
++bool cf_axi_dds_buffering_available(struct iio_dev *indio_dev)
++{
++	struct cf_axi_dds_state *st = iio_priv(indio_dev);
++	return !st->processed_en;
++}
++EXPORT_SYMBOL_GPL(cf_axi_dds_buffering_available);
+ 
+ void __cf_axi_dds_datasel(struct cf_axi_dds_state *st,
+ 	int channel, enum dds_data_select sel)
+@@ -712,6 +719,15 @@ static int cf_axi_dds_read_raw(struct iio_dev *indio_dev,
+ 		}
+ 		*val = st->enable;
+ 
++		cf_axi_dds_unlock(st);
++		return IIO_VAL_INT;
++	case IIO_CHAN_INFO_PROCESSED:
++		/* Only support the Voltage channel for processed */
++		if (!chan->output || chan->type != IIO_VOLTAGE) {
++			ret = -EINVAL;
++			break;
++		}
++		*val = st->processed_en;
+ 		cf_axi_dds_unlock(st);
+ 		return IIO_VAL_INT;
+ 	case IIO_CHAN_INFO_SCALE:
+@@ -817,16 +833,50 @@ static int cf_axi_dds_write_raw(struct iio_dev *indio_dev,
+ 
+ 	switch (mask) {
+ 	case IIO_CHAN_INFO_RAW:
+-		if (!chan->output) {
++		if (!chan->output)  {
+ 			ret = -EINVAL;
+ 			break;
+ 		}
+ 
++		if (st->processed_en) {
++			ret = -EBUSY;
++			break;
++		}
++
+ 		st->enable = !!val;
+ 		cf_axi_dds_start_sync(st, 0);
+ 		cf_axi_dds_datasel(st, -1,
+ 			st->enable ? DATA_SEL_DDS : DATA_SEL_ZERO);
+ 
++		break;
++	case IIO_CHAN_INFO_PROCESSED:
++		/* Only support the Voltage channel for processed */
++		if (!chan->output || chan->type != IIO_VOLTAGE) {
++			ret = -EINVAL;
++			break;
++		}
++
++		/* This will prevent us from stomping on buffer mode */
++		ret = iio_device_claim_direct_mode(indio_dev);
++		if (ret) {
++			ret = -EBUSY;
++			break;
++		}
++
++		/* Wants to enable processed, and not yet enabled */
++		if (val && !st->processed_en) {
++			/* Clear the DMA status reg*/
++			dds_write(st, ADI_REG_VDMA_STATUS, ADI_VDMA_OVF | ADI_VDMA_UNF);
++			cf_axi_dds_start_sync(st, 1);
++			cf_axi_dds_datasel(st, -1, DATA_SEL_DMA);	
++			st->processed_en = true;
++		} else if (!val) {
++			/* Wants to disable processed. Set everything to DDS */
++			cf_axi_dds_start_sync(st, 0);
++			cf_axi_dds_datasel(st, -1, DATA_SEL_DDS);			
++			st->processed_en = false;
++		}
++		iio_device_release_direct_mode(indio_dev);
+ 		break;
+ 	case IIO_CHAN_INFO_SCALE:
+ 		if (chan->type == IIO_VOLTAGE) {
+@@ -1876,6 +1926,7 @@ struct axidds_core_info {
+ 	bool rate_format_skip_en;
+ 	bool complex_modified;
+ 	bool issue_sync_en;
++	bool has_processed;
+ 	struct cf_axi_dds_chip_info *chip_info;
+ 	unsigned int data_format;
+ 	unsigned int rate;
+@@ -1902,6 +1953,8 @@ static int cf_axi_dds_setup_chip_info_tbl(struct cf_axi_dds_state *st,
+ 
+ 	reg = dds_read(st, ADI_REG_CONFIG);
+ 
++	
++
+ 	for (c = 0, i = 0; i < m; i++, c++) {
+ 		st->chip_info_generated.channel[c].type = IIO_VOLTAGE;
+ 		st->chip_info_generated.channel[c].output = 1;
+@@ -1915,6 +1968,10 @@ static int cf_axi_dds_setup_chip_info_tbl(struct cf_axi_dds_state *st,
+ 		st->chip_info_generated.channel[c].scan_index = i;
+ 		st->chip_info_generated.channel[c].info_mask_shared_by_type =
+ 			BIT(IIO_CHAN_INFO_SAMP_FREQ);
++		if (info->has_processed) {
++			st->chip_info_generated.channel[c].info_mask_shared_by_type |=	
++				BIT(IIO_CHAN_INFO_PROCESSED);
++		}
+ 
+ 		if (!(reg & ADI_IQCORRECTION_DISABLE))
+ 			st->chip_info_generated.channel[c].info_mask_separate =
+@@ -2084,6 +2141,7 @@ static const struct axidds_core_info ad9081_1_00_a_info = {
+ 	.name = "AD9081",
+ 	.standalone = true,
+ 	.complex_modified = true,
++	.has_processed = true,
+ };
+ 
+ static const struct axidds_core_info ad9081_1_00_a_real_info = {
+diff --git a/drivers/iio/frequency/cf_axi_dds.h b/drivers/iio/frequency/cf_axi_dds.h
+index fee820404e73..050815a2cd16 100644
+--- a/drivers/iio/frequency/cf_axi_dds.h
++++ b/drivers/iio/frequency/cf_axi_dds.h
+@@ -297,6 +297,7 @@ static inline struct cf_axi_converter *to_converter(struct device *dev)
+ 	return ERR_PTR(-ENODEV);
+ };
+ 
++bool cf_axi_dds_buffering_available(struct iio_dev *indio_dev); 
+ int cf_axi_dds_configure_buffer(struct iio_dev *indio_dev);
+ void cf_axi_dds_unconfigure_buffer(struct iio_dev *indio_dev);
+ int cf_axi_dds_datasel(struct cf_axi_dds_state *st,
+diff --git a/drivers/iio/frequency/cf_axi_dds_buffer_stream.c b/drivers/iio/frequency/cf_axi_dds_buffer_stream.c
+index c684aef865bc..360167932b32 100644
+--- a/drivers/iio/frequency/cf_axi_dds_buffer_stream.c
++++ b/drivers/iio/frequency/cf_axi_dds_buffer_stream.c
+@@ -8,6 +8,7 @@
+ 
+ #include <linux/slab.h>
+ #include <linux/kernel.h>
++#include <linux/errno.h>
+ #include <linux/io.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/dmaengine.h>
+@@ -71,7 +72,10 @@ static int dds_buffer_state_set(struct iio_dev *indio_dev, bool state)
+ 
+ static int dds_buffer_preenable(struct iio_dev *indio_dev)
+ {
+-	return dds_buffer_state_set(indio_dev, 1);
++	if (cf_axi_dds_buffering_available(indio_dev))
++		return dds_buffer_state_set(indio_dev, 1);
++	else
++		return -EBUSY;
+ }
+ 
+ static int dds_buffer_postdisable(struct iio_dev *indio_dev)
+-- 
+2.34.1
+

@@ -15,6 +15,28 @@ added.
 
 Baseline: [54eb23f](https://github.com/analogdevicesinc/linux/commits/54eb23f4b5c6093916f208772627f7b68f495559)
 
+### 0002-AD9081-Add-direct-DMA-enable-attribute.patch
+This patch provides an IIO attribute for enabling DMA data flow in the TX IP core
+directly, without needing to open an IIO Buffer. This is a useful feature when
+a Tx data stream is generated in HDL and can be switched in place of the DMA
+stream from the IIO buffering system.
+
+The patch uses the PROCESSED IIO attribute, which will expose itself as the
+`out_voltage_input` file for the Tx IIO device.   If set to a 1/True, the IP
+core will set all channels to DMA mode and set the equivalent registers as if
+a buffer was created. If transitioned to a 0/False, the channels will be set
+back to DDS mode.
+
+This new mode is mutually exclusive to buffer mode.  If a buffer is opened,
+setting `out_voltage_input` will return a -EBUSY error. Similarly, if this mode
+is enabled, opening a buffer or setting `raw` on one of the DDS channels will
+also result in a -EBUSY error.
+
+See [ad9081_processed_test.c](../libiio_examples/processed_patch_test/ad9081_processed_test.c)
+for a sample libiio based application which tests the mutual exclusivity of the
+updates.
+
+Baseline: [54eb23f](https://github.com/analogdevicesinc/linux/commits/54eb23f4b5c6093916f208772627f7b68f495559)
 
 ### **(OBSOLETE)** 0001-AD9081-Explicit-PLL-Config-for-12Ghz-DAC-333MHz-Ref.patch **(OBSOLETE)**
 Due to integer math, the algorithm to calculate the PLL divisors to meet the DAC
